@@ -32,12 +32,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/cadvisor/integration/common"
-
-	cadvisorApi "github.com/google/cadvisor/info/v2"
-
 	"github.com/golang/glog"
+	cadvisorApi "github.com/google/cadvisor/info/v2"
 )
+
+// must be able to ssh into hosts without password
+// godep go run runner.go --logtostderr --v 2 <list of hosts>
 
 const cadvisorBinary = "cadvisor"
 
@@ -47,22 +47,15 @@ var testRetryCount = flag.Int("test-retry-count", 3, "Number of times to retry f
 var testRetryWhitelist = flag.String("test-retry-whitelist", "", "Path to newline separated list of regexexp for test failures that should be retried.  If empty, no tests are retried.")
 var retryRegex *regexp.Regexp
 
-func getAttributes(ipAddress, portStr string) (*cadvisorApi.Attributes, error) {
-	// Get host attributes and log attributes if the tests fail.
-	var attributes cadvisorApi.Attributes
-	resp, err := http.Get(fmt.Sprintf("http://%s:%s/api/v2.1/attributes", ipAddress, portStr))
+func getAttributes(host, portStr string) (*cadvisorApi.Attributes, error) {
+	output, err := exec.Command("ssh", host, "--", "curl", "-L", fmt.Sprintf("http://127.0.0.1:%s/api/v2.1/attributes", portStr)).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get attributes - %v", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to get attributes. Status code - %v", resp.StatusCode)
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read attributes response body - %v", err)
-	}
-	if err := json.Unmarshal(body, &attributes); err != nil {
+
+	// Get host attributes and log attributes if the tests fail.
+	var attributes cadvisorApi.Attributes
+	if err := json.Unmarshal(output, &attributes); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal attributes - %v", err)
 	}
 	return &attributes, nil
@@ -80,20 +73,19 @@ func RunCommand(cmd string, args ...string) error {
 func PushAndRunTests(host, testDir string) error {
 	// Push binary.
 	glog.Infof("Pushing cAdvisor binary to %q...", host)
-	args := common.GetGCComputeArgs("ssh", host, "--", "mkdir", "-p", testDir)
-	err := RunCommand("gcloud", args...)
+
+	err := RunCommand("ssh", host, "--", "mkdir", "-p", testDir)
 	if err != nil {
 		return fmt.Errorf("failed to make remote testing directory: %v", err)
 	}
 	defer func() {
-		args := common.GetGCComputeArgs("ssh", host, "--", "rm", "-rf", testDir)
-		err := RunCommand("gcloud", args...)
+		err = RunCommand("ssh", host, "--", "rm", "-rf", testDir)
 		if err != nil {
 			glog.Errorf("Failed to cleanup test directory: %v", err)
 		}
 	}()
-	args = common.GetGCComputeArgs("copy-files", cadvisorBinary, fmt.Sprintf("%s:%s", host, testDir))
-	err = RunCommand("gcloud", args...)
+
+	err = RunCommand("scp", "-r", cadvisorBinary, fmt.Sprintf("%s:%s", host, testDir))
 	if err != nil {
 		return fmt.Errorf("failed to copy binary: %v", err)
 	}
@@ -103,24 +95,19 @@ func PushAndRunTests(host, testDir string) error {
 	portStr := strconv.Itoa(*port)
 	errChan := make(chan error)
 	go func() {
-		args = common.GetGCComputeArgs("ssh", host, "--", fmt.Sprintf("sudo %s --port %s --logtostderr &> %s/log.txt", path.Join(testDir, cadvisorBinary), portStr, testDir))
-		err = RunCommand("gcloud", args...)
+		err = RunCommand("ssh", host, "--", fmt.Sprintf("sudo %s --port %s --logtostderr  &> %s/log.txt", path.Join(testDir, cadvisorBinary), portStr))
+
+
 		if err != nil {
 			errChan <- fmt.Errorf("error running cAdvisor: %v", err)
 		}
 	}()
 	defer func() {
-		args = common.GetGCComputeArgs("ssh", host, "--", "sudo", "pkill", cadvisorBinary)
-		err := RunCommand("gcloud", args...)
+		err = RunCommand("ssh", host, "--", "sudo", "pkill", cadvisorBinary)
 		if err != nil {
 			glog.Errorf("Failed to cleanup: %v", err)
 		}
 	}()
-
-	ipAddress, err := common.GetGceIp(host)
-	if err != nil {
-		return fmt.Errorf("failed to get GCE IP: %v", err)
-	}
 
 	// Wait for cAdvisor to come up.
 	endTime := time.Now().Add(*cadvisorTimeout)
@@ -132,7 +119,7 @@ func PushAndRunTests(host, testDir string) error {
 			return err
 		case <-time.After(500 * time.Millisecond):
 			// Stop waiting when cAdvisor is healthy..
-			resp, err := http.Get(fmt.Sprintf("http://%s:%s/healthz", ipAddress, portStr))
+			resp, err := http.Get(fmt.Sprintf("http://%s:%s/healthz", host, portStr))
 			if err == nil && resp.StatusCode == http.StatusOK {
 				done = true
 				break
@@ -144,7 +131,7 @@ func PushAndRunTests(host, testDir string) error {
 	}
 
 	// Get attributes for debugging purposes.
-	attributes, err := getAttributes(ipAddress, portStr)
+	attributes, err := getAttributes(host, portStr)
 	if err != nil {
 		return fmt.Errorf("%v - %q", err, host)
 	}
@@ -157,7 +144,7 @@ func PushAndRunTests(host, testDir string) error {
 			glog.Warningf("Retrying (%d of %d) tests on host %s due to error %v", i, *testRetryCount, host, err)
 		}
 		// Run the command
-		err = RunCommand("godep", "go", "test", "github.com/google/cadvisor/integration/tests/...", "--host", host, "--port", portStr)
+		err := RunCommand("godep", "go", "test", "github.com/google/cadvisor/integration/tests/...", "--host", host, "--port", portStr)
 		if err == nil {
 			// On success, break out of retry loop
 			break
@@ -171,8 +158,8 @@ func PushAndRunTests(host, testDir string) error {
 	}
 	if err != nil {
 		// Copy logs from the host
-		args = common.GetGCComputeArgs("copy-files", fmt.Sprintf("%s:%s/log.txt", host, testDir), "./")
-		err = RunCommand("gcloud", args...)
+		err = RunCommand("scp", fmt.Sprintf("%s:%s/log.txt", host, testDir), "./")
+
 		if err != nil {
 			return fmt.Errorf("error fetching logs: %v", err)
 		}
