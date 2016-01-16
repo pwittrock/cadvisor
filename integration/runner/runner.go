@@ -45,6 +45,7 @@ var cadvisorTimeout = flag.Duration("cadvisor_timeout", 15*time.Second, "Time to
 var port = flag.Int("port", 8080, "Port in which to start cAdvisor in the remote host")
 var testRetryCount = flag.Int("test-retry-count", 3, "Number of times to retry failed tests before failing.")
 var testRetryWhitelist = flag.String("test-retry-whitelist", "", "Path to newline separated list of regexexp for test failures that should be retried.  If empty, no tests are retried.")
+var sshConfig = flag.String("ssh-config", "", "Path to ssh config to use for talking to remote hosts.")
 var retryRegex *regexp.Regexp
 
 func getAttributes(host, portStr string) (*cadvisorApi.Attributes, error) {
@@ -70,22 +71,31 @@ func RunCommand(cmd string, args ...string) error {
 	return nil
 }
 
+func RunSshCommand(cmd string, args ...string) error {
+	a := []string{}
+	if *sshConfig != "" {
+		a = append(a, "-F", *sshConfig)
+	}
+	a = append(a, args...)
+	return RunCommand(cmd, a...)
+}
+
 func PushAndRunTests(host, testDir string) error {
 	// Push binary.
 	glog.Infof("Pushing cAdvisor binary to %q...", host)
 
-	err := RunCommand("ssh", host, "--", "mkdir", "-p", testDir)
+	err := RunSshCommand("ssh", host, "--", "mkdir", "-p", testDir)
 	if err != nil {
 		return fmt.Errorf("failed to make remote testing directory: %v", err)
 	}
 	defer func() {
-		err = RunCommand("ssh", host, "--", "rm", "-rf", testDir)
+		err = RunSshCommand("ssh", host, "--", "rm", "-rf", testDir)
 		if err != nil {
 			glog.Errorf("Failed to cleanup test directory: %v", err)
 		}
 	}()
 
-	err = RunCommand("scp", "-r", cadvisorBinary, fmt.Sprintf("%s:%s", host, testDir))
+	err = RunSshCommand("scp", "-r", cadvisorBinary, fmt.Sprintf("%s:%s", host, testDir))
 	if err != nil {
 		return fmt.Errorf("failed to copy binary: %v", err)
 	}
@@ -95,15 +105,13 @@ func PushAndRunTests(host, testDir string) error {
 	portStr := strconv.Itoa(*port)
 	errChan := make(chan error)
 	go func() {
-		err = RunCommand("ssh", host, "--", fmt.Sprintf("sudo %s --port %s --logtostderr  &> %s/log.txt", path.Join(testDir, cadvisorBinary), portStr))
-
-
+		err = RunSshCommand("ssh", host, "--", fmt.Sprintf("sudo %s --port %s --logtostderr  &> %s/log.txt", path.Join(testDir, cadvisorBinary), portStr))
 		if err != nil {
 			errChan <- fmt.Errorf("error running cAdvisor: %v", err)
 		}
 	}()
 	defer func() {
-		err = RunCommand("ssh", host, "--", "sudo", "pkill", cadvisorBinary)
+		err = RunSshCommand("ssh", host, "--", "sudo", "pkill", cadvisorBinary)
 		if err != nil {
 			glog.Errorf("Failed to cleanup: %v", err)
 		}
