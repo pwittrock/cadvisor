@@ -37,7 +37,7 @@ import (
 )
 
 // must be able to ssh into hosts without password
-// godep go run runner.go --logtostderr --v 2 <list of hosts>
+// godep go run ./integration/runner.go --logtostderr --v 2 <list of hosts>
 
 const cadvisorBinary = "cadvisor"
 
@@ -62,6 +62,11 @@ func getAttributes(host, portStr string) (*cadvisorApi.Attributes, error) {
 	return &attributes, nil
 }
 
+func getIp(host string) (string, error) {
+	out, err := exec.Command("awk", fmt.Sprintf("/Host %s/ {getline; print $2}", host), *sshConfig).CombinedOutput()
+	return fmt.Sprintf("%s", out), err
+}
+
 func RunCommand(cmd string, args ...string) error {
 	output, err := exec.Command(cmd, args...).CombinedOutput()
 	if err != nil {
@@ -83,8 +88,12 @@ func RunSshCommand(cmd string, args ...string) error {
 func PushAndRunTests(host, testDir string) error {
 	// Push binary.
 	glog.Infof("Pushing cAdvisor binary to %q...", host)
+	ipAddress, err := getIp(host)
+	if err != nil {
+		return fmt.Errorf("failed to get ip address of host: %s, %v", ipAddress, err)
+	}
 
-	err := RunSshCommand("ssh", host, "--", "mkdir", "-p", testDir)
+	err = RunSshCommand("ssh", host, "--", "mkdir", "-p", testDir)
 	if err != nil {
 		return fmt.Errorf("failed to make remote testing directory: %v", err)
 	}
@@ -105,7 +114,7 @@ func PushAndRunTests(host, testDir string) error {
 	portStr := strconv.Itoa(*port)
 	errChan := make(chan error)
 	go func() {
-		err = RunSshCommand("ssh", host, "--", fmt.Sprintf("sudo %s --port %s --logtostderr  &> %s/log.txt", path.Join(testDir, cadvisorBinary), portStr))
+		err = RunSshCommand("ssh", host, "--", fmt.Sprintf("sudo %s --port %s --logtostderr  &> %s/log.txt", path.Join(testDir, cadvisorBinary), portStr, testDir))
 		if err != nil {
 			errChan <- fmt.Errorf("error running cAdvisor: %v", err)
 		}
@@ -127,7 +136,7 @@ func PushAndRunTests(host, testDir string) error {
 			return err
 		case <-time.After(500 * time.Millisecond):
 			// Stop waiting when cAdvisor is healthy..
-			resp, err := http.Get(fmt.Sprintf("http://%s:%s/healthz", host, portStr))
+			resp, err := http.Get(fmt.Sprintf("http://%s:%s/healthz", ipAddress, portStr))
 			if err == nil && resp.StatusCode == http.StatusOK {
 				done = true
 				break
@@ -152,7 +161,7 @@ func PushAndRunTests(host, testDir string) error {
 			glog.Warningf("Retrying (%d of %d) tests on host %s due to error %v", i, *testRetryCount, host, err)
 		}
 		// Run the command
-		err := RunCommand("godep", "go", "test", "github.com/google/cadvisor/integration/tests/...", "--host", host, "--port", portStr)
+		err := RunCommand("godep", "go", "test", "github.com/google/cadvisor/integration/tests/...", "--host", ipAddress, "--port", portStr)
 		if err == nil {
 			// On success, break out of retry loop
 			break
@@ -166,7 +175,7 @@ func PushAndRunTests(host, testDir string) error {
 	}
 	if err != nil {
 		// Copy logs from the host
-		err = RunCommand("scp", fmt.Sprintf("%s:%s/log.txt", host, testDir), "./")
+		err = RunSshCommand("scp", fmt.Sprintf("%s:%s/log.txt", host, testDir), "./")
 
 		if err != nil {
 			return fmt.Errorf("error fetching logs: %v", err)
